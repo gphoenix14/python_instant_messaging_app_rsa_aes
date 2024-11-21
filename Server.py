@@ -3,13 +3,11 @@ import threading
 import json
 import os
 from datetime import datetime
+import argparse
 from Crypto.PublicKey import RSA
 
 # Dizionario per memorizzare gli utenti connessi
-utenti_connessi = {}  # username: { 'conn': connessione, 'indirizzo': indirizzo, 'chiave_pubblica': chiave_pubblica, 'gruppo': gruppo, 'psk': psk, 'mode': 'broadcast' o 'multicast' }
-
-# Memorizza i gruppi e le loro PSK
-gruppi = {}
+utenti_connessi = {}  # username: { 'conn': connessione, 'indirizzo': indirizzo, 'chiave_pubblica': chiave_pubblica }
 
 # Funzione per inizializzare il contatore del file di log
 def inizializza_contatore_log():
@@ -22,28 +20,29 @@ def inizializza_contatore_log():
 def gestisci_client(conn, indirizzo, contatore_log):
     try:
         # Riceve le informazioni iniziali dal client
-        dati_iniziali = conn.recv(4096).decode()
+        dati_iniziali_bytes = conn.recv(4096)
+        dati_iniziali = dati_iniziali_bytes.decode()
         info = json.loads(dati_iniziali)
         username = info['username']
         chiave_pubblica = info['chiave_pubblica']
-        gruppo = info['gruppo']
-        psk_gruppo = info['psk_gruppo']
+
+        # Verifica se l'username è già in uso
+        if username in utenti_connessi:
+            conn.sendall(f"Errore: L'username '{username}' è già in uso. Scegli un altro username.".encode())
+            conn.close()
+            return
     except Exception as e:
         print(f"Errore nella ricezione dei dati iniziali: {e}")
         conn.close()
         return
 
-    # Controlla se il gruppo esiste già e verifica la PSK
-    if gruppo in gruppi:
-        if gruppi[gruppo] != psk_gruppo:
-            conn.sendall("Errore: PSK del gruppo non corretta.".encode())
-            conn.close()
-            return
-    else:
-        gruppi[gruppo] = psk_gruppo
-
     # Memorizza l'utente
-    utenti_connessi[username] = {'conn': conn, 'indirizzo': indirizzo, 'chiave_pubblica': chiave_pubblica, 'gruppo': gruppo, 'psk': psk_gruppo, 'mode': 'broadcast', 'encrypt': False}
+    utenti_connessi[username] = {
+        'conn': conn,
+        'indirizzo': indirizzo,
+        'chiave_pubblica': chiave_pubblica,
+        'encrypt': False
+    }
 
     # Invia messaggio di benvenuto al client
     conn.sendall("Connesso al server. Benvenuto! per info sui comandi /help".encode())
@@ -100,14 +99,6 @@ def gestisci_client(conn, indirizzo, contatore_log):
                     else:
                         conn.sendall("Comando non riconosciuto.".encode())
 
-                elif comando == '/broadcast':
-                    utenti_connessi[username]['mode'] = 'broadcast'
-                    conn.sendall("Modalità broadcast attivata.".encode())
-
-                elif comando == '/multicast':
-                    utenti_connessi[username]['mode'] = 'multicast'
-                    conn.sendall("Modalità multicast attivata.".encode())
-
                 elif comando == '/get_pubkey':
                     target_username = comandi[1]
                     if target_username in utenti_connessi:
@@ -122,19 +113,10 @@ def gestisci_client(conn, indirizzo, contatore_log):
 
             else:
                 # Messaggio normale
-                mode = utenti_connessi[username]['mode']
-                if mode == 'broadcast':
-                    formatted_message = f"[{timestamp}] {username}: {messaggio_decodificato}"
-                    for user in utenti_connessi:
-                        if utenti_connessi[user]['mode'] == 'broadcast':
-                            utenti_connessi[user]['conn'].sendall(formatted_message.encode())
-                elif mode == 'multicast':
-                    # Invia messaggio al gruppo
-                    for user in utenti_connessi:
-                        if utenti_connessi[user]['gruppo'] == utenti_connessi[username]['gruppo']:
-                            utenti_connessi[user]['conn'].sendall(messaggio)
-                else:
-                    conn.sendall("Modalità non riconosciuta.".encode())
+                formatted_message = f"[{timestamp}] {username}: {messaggio_decodificato}"
+                for user in utenti_connessi:
+                    # Invia il messaggio a tutti, compreso il mittente
+                    utenti_connessi[user]['conn'].sendall(formatted_message.encode())
 
         except Exception as e:
             print(f"Errore: {e}")
@@ -156,8 +138,12 @@ def gestisci_client(conn, indirizzo, contatore_log):
 
 # Configurazione del server
 def avvia_server():
+    parser = argparse.ArgumentParser(description='Avvia il server di chat.')
+    parser.add_argument('-p', '--port', type=int, default=8000, help='Porta su cui il server ascolterà.')
+    args = parser.parse_args()
+
     host = '0.0.0.0'
-    port = 8000  # Puoi cambiare la porta se necessario
+    port = args.port  # Porta specificata con il parametro -p
 
     # Inizializza il contatore del file di log
     contatore_log = inizializza_contatore_log()
@@ -167,7 +153,7 @@ def avvia_server():
     server_socket.bind((host, port))
     server_socket.listen()
 
-    print("Server in ascolto...")
+    print(f"Server in ascolto sulla porta {port}...")
 
     while True:
         conn, indirizzo = server_socket.accept()

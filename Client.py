@@ -1,13 +1,12 @@
 import socket
 import threading
 import json
-from Crypto.PublicKey import RSA
-from Crypto.Cipher import PKCS1_OAEP, AES
-from Crypto.Util.Padding import pad, unpad
 import sys
 import queue
+from Crypto.PublicKey import RSA
+from Crypto.Cipher import PKCS1_OAEP
 
-def ricevi_messaggi(sock, gruppo, psk_gruppo, chiave_privata, queue_pubkey):
+def ricevi_messaggi(sock, chiave_privata, queue_pubkey):
     while True:
         try:
             data = sock.recv(4096)
@@ -17,7 +16,12 @@ def ricevi_messaggi(sock, gruppo, psk_gruppo, chiave_privata, queue_pubkey):
             try:
                 # Prova a decodificare come stringa
                 messaggio = data.decode()
-                if "[Whisper da" in messaggio:
+                if messaggio.startswith("Errore:"):
+                    # Errore ricevuto dal server (es. username già in uso)
+                    print(messaggio)
+                    sock.close()
+                    sys.exit()
+                elif "[Whisper da" in messaggio:
                     # Messaggio privato
                     # Trova l'indice di "]:"
                     indice_header_end = messaggio.find("]:")
@@ -46,18 +50,15 @@ def ricevi_messaggi(sock, gruppo, psk_gruppo, chiave_privata, queue_pubkey):
                     # Messaggio normale o messaggio di benvenuto
                     print(messaggio)
             except UnicodeDecodeError:
-                # Se fallisce, prova a decriptare con AES (per messaggi multicast)
-                key = pad(psk_gruppo.encode(), 32)
-                cipher = AES.new(key, AES.MODE_ECB)
-                messaggio_decriptato = unpad(cipher.decrypt(data), AES.block_size)
-                print(messaggio_decriptato.decode())
+                # Se fallisce, stampa errore
+                print("Errore nella decodifica del messaggio.")
         except Exception as e:
             print(f"Errore: {e}")
             break
 
 if __name__ == "__main__":
-    if len(sys.argv) != 8:
-        print("Uso: python client.py <ip_server> <porta_server> <username> <path_chiave_pubblica> <path_chiave_privata> <gruppo> <psk_gruppo>")
+    if len(sys.argv) != 6:
+        print("Uso: python client.py <ip_server> <porta_server> <username> <path_chiave_pubblica> <path_chiave_privata>")
         sys.exit()
 
     ip_server = sys.argv[1]
@@ -65,8 +66,6 @@ if __name__ == "__main__":
     username = sys.argv[3]
     path_chiave_pubblica = sys.argv[4]
     path_chiave_privata = sys.argv[5]
-    gruppo = sys.argv[6]
-    psk_gruppo = sys.argv[7]
 
     # Legge la chiave pubblica dal file
     with open(path_chiave_pubblica, 'r') as f:
@@ -83,30 +82,42 @@ if __name__ == "__main__":
     # Invia le informazioni iniziali al server
     info = {
         'username': username,
-        'chiave_pubblica': chiave_pubblica,
-        'gruppo': gruppo,
-        'psk_gruppo': psk_gruppo
+        'chiave_pubblica': chiave_pubblica
     }
     sock.sendall(json.dumps(info).encode())
+
+    # Attende la risposta dal server (benvenuto o errore)
+    response = sock.recv(4096).decode()
+    if response.startswith("Errore:"):
+        print(response)
+        sock.close()
+        sys.exit()
+    else:
+        print(response)
 
     # Coda per ricevere la chiave pubblica del destinatario
     queue_pubkey = queue.Queue()
 
+    # Dizionario per le chiavi pubbliche cache
+    public_keys_cache = {}  # username: chiave_pubblica
+
     # Avvia thread per ricevere messaggi
-    threading.Thread(target=ricevi_messaggi, args=(sock, gruppo, psk_gruppo, chiave_privata, queue_pubkey), daemon=True).start()
+    threading.Thread(target=ricevi_messaggi, args=(sock, chiave_privata, queue_pubkey), daemon=True).start()
 
     # Stato iniziale
     encrypt = True  # La crittografia è attiva di default
-    mode = 'broadcast'
+    current_recipient = None  # Nessun destinatario di chat privata di default
 
     # Dichiara i comandi disponibili
     help_message = """
 Comandi disponibili:
 /help - Mostra questo messaggio di aiuto
-/whisper <username> <messaggio> - Invia un messaggio privato a un utente
-/encrypt <on/off> - Abilita o disabilita la crittografia per i messaggi privati
+/chat <username> - Entra in modalità chat privata con un utente
 /broadcast - Passa alla modalità broadcast (messaggi a tutti)
-/multicast - Passa alla modalità multicast (messaggi al gruppo)
+/whisper <username> <messaggio> - Invia un messaggio privato a un utente
+/refresh_key <username> - Aggiorna la chiave pubblica di un utente
+/print_keys - Mostra le chiavi pubbliche in cache
+/encrypt <on/off> - Abilita o disabilita la crittografia per i messaggi privati
 """
 
     while True:
@@ -116,7 +127,16 @@ Comandi disponibili:
                 comandi = messaggio.strip().split()
                 comando = comandi[0]
 
-                if comando == '/whisper':
+                if comando == '/chat':
+                    if len(comandi) != 2:
+                        print("Uso corretto: /chat <username>")
+                        continue
+                    current_recipient = comandi[1]
+                    print(f"Modalità chat privata con {current_recipient} attivata.")
+                elif comando == '/broadcast':
+                    current_recipient = None
+                    print("Modalità broadcast attivata.")
+                elif comando == '/whisper':
                     if len(comandi) < 3:
                         print("Uso corretto: /whisper <destinatario> <messaggio>")
                         continue
@@ -125,28 +145,35 @@ Comandi disponibili:
                     messaggio_privato = messaggio.partition(destinatario)[2].strip()
 
                     if encrypt:
-                        # Richiede la chiave pubblica del destinatario al server
-                        sock.sendall(f"/get_pubkey {destinatario}".encode())
+                        # Controlla se la chiave pubblica del destinatario è in cache
+                        if destinatario in public_keys_cache:
+                            chiave_pubblica_dest = public_keys_cache[destinatario]
+                        else:
+                            # Richiede la chiave pubblica del destinatario al server
+                            sock.sendall(f"/get_pubkey {destinatario}".encode())
 
-                        # Attende la chiave pubblica dal thread di ricezione
-                        received_key = False
-                        while True:
-                            try:
-                                # Attende al massimo 5 secondi
-                                destinatario_ricevuto, chiave_pubblica_dest = queue_pubkey.get(timeout=5)
-                                if destinatario_ricevuto == destinatario:
-                                    received_key = True
+                            # Attende la chiave pubblica dal thread di ricezione
+                            received_key = False
+                            while True:
+                                try:
+                                    # Attende al massimo 5 secondi
+                                    destinatario_ricevuto, chiave_pubblica_dest = queue_pubkey.get(timeout=5)
+                                    if destinatario_ricevuto == destinatario:
+                                        received_key = True
+                                        break
+                                except queue.Empty:
+                                    print(f"Errore: tempo scaduto per la ricezione della chiave pubblica di {destinatario}.")
                                     break
-                            except queue.Empty:
-                                print(f"Errore: tempo scaduto per la ricezione della chiave pubblica di {destinatario}.")
-                                break
 
-                        if not received_key:
-                            continue
+                            if not received_key:
+                                continue
 
-                        if chiave_pubblica_dest.startswith("Errore"):
-                            print(chiave_pubblica_dest)
-                            continue
+                            if chiave_pubblica_dest.startswith("Errore"):
+                                print(chiave_pubblica_dest)
+                                continue
+
+                            # Salva la chiave pubblica in cache
+                            public_keys_cache[destinatario] = chiave_pubblica_dest
 
                         chiave_pubblica_rsa = RSA.import_key(chiave_pubblica_dest)
                         cipher_rsa = PKCS1_OAEP.new(chiave_pubblica_rsa)
@@ -157,6 +184,46 @@ Comandi disponibili:
                     else:
                         # Invia il messaggio in chiaro
                         sock.sendall(messaggio.encode())
+
+                elif comando == '/refresh_key':
+                    if len(comandi) != 2:
+                        print("Uso corretto: /refresh_key <username>")
+                        continue
+                    destinatario = comandi[1]
+                    # Richiede la chiave pubblica aggiornata al server
+                    sock.sendall(f"/get_pubkey {destinatario}".encode())
+
+                    # Attende la chiave pubblica dal thread di ricezione
+                    received_key = False
+                    while True:
+                        try:
+                            # Attende al massimo 5 secondi
+                            destinatario_ricevuto, chiave_pubblica_dest = queue_pubkey.get(timeout=5)
+                            if destinatario_ricevuto == destinatario:
+                                received_key = True
+                                break
+                        except queue.Empty:
+                            print(f"Errore: tempo scaduto per la ricezione della chiave pubblica di {destinatario}.")
+                            break
+
+                    if not received_key:
+                        continue
+
+                    if chiave_pubblica_dest.startswith("Errore"):
+                        print(chiave_pubblica_dest)
+                        continue
+
+                    # Aggiorna la chiave pubblica in cache
+                    public_keys_cache[destinatario] = chiave_pubblica_dest
+                    print(f"Chiave pubblica di {destinatario} aggiornata.")
+
+                elif comando == '/print_keys':
+                    if public_keys_cache:
+                        print("Chiavi pubbliche in cache:")
+                        for user, key in public_keys_cache.items():
+                            print(f"Utente: {user}\n{key}\n")
+                    else:
+                        print("Nessuna chiave pubblica in cache.")
 
                 elif comando == '/encrypt':
                     if len(comandi) < 2:
@@ -173,16 +240,6 @@ Comandi disponibili:
                     # Informa il server
                     sock.sendall(messaggio.encode())
 
-                elif comando == '/broadcast':
-                    mode = 'broadcast'
-                    # Informa il server
-                    sock.sendall(messaggio.encode())
-
-                elif comando == '/multicast':
-                    mode = 'multicast'
-                    # Informa il server
-                    sock.sendall(messaggio.encode())
-
                 elif comando == '/help':
                     print(help_message)
 
@@ -190,16 +247,55 @@ Comandi disponibili:
                     print("Comando non riconosciuto. Digita /help per la lista dei comandi.")
 
             else:
-                # Messaggio normale
-                if mode == 'multicast':
-                    # Crittografia AES
-                    key = pad(psk_gruppo.encode(), 32)
-                    cipher = AES.new(key, AES.MODE_ECB)
-                    messaggio_crittografato = cipher.encrypt(pad(messaggio.encode(), AES.block_size))
-                    sock.sendall(messaggio_crittografato)
+                if current_recipient:
+                    # Invia il messaggio come whisper al destinatario corrente
+                    destinatario = current_recipient
+                    messaggio_privato = messaggio
+
+                    if encrypt:
+                        # Controlla se la chiave pubblica del destinatario è in cache
+                        if destinatario in public_keys_cache:
+                            chiave_pubblica_dest = public_keys_cache[destinatario]
+                        else:
+                            # Richiede la chiave pubblica del destinatario al server
+                            sock.sendall(f"/get_pubkey {destinatario}".encode())
+
+                            # Attende la chiave pubblica dal thread di ricezione
+                            received_key = False
+                            while True:
+                                try:
+                                    # Attende al massimo 5 secondi
+                                    destinatario_ricevuto, chiave_pubblica_dest = queue_pubkey.get(timeout=5)
+                                    if destinatario_ricevuto == destinatario:
+                                        received_key = True
+                                        break
+                                except queue.Empty:
+                                    print(f"Errore: tempo scaduto per la ricezione della chiave pubblica di {destinatario}.")
+                                    break
+
+                            if not received_key:
+                                continue
+
+                            if chiave_pubblica_dest.startswith("Errore"):
+                                print(chiave_pubblica_dest)
+                                continue
+
+                            # Salva la chiave pubblica in cache
+                            public_keys_cache[destinatario] = chiave_pubblica_dest
+
+                        chiave_pubblica_rsa = RSA.import_key(chiave_pubblica_dest)
+                        cipher_rsa = PKCS1_OAEP.new(chiave_pubblica_rsa)
+                        messaggio_crittografato = cipher_rsa.encrypt(messaggio_privato.encode())
+                        # Invia il messaggio crittografato in formato esadecimale per evitare problemi di codifica
+                        messaggio_hex = messaggio_crittografato.hex()
+                        sock.sendall(f"/whisper {destinatario} {messaggio_hex}".encode())
+                    else:
+                        # Invia il messaggio in chiaro
+                        sock.sendall(f"/whisper {destinatario} {messaggio_privato}".encode())
                 else:
-                    # Invia il messaggio in chiaro
+                    # Invia il messaggio al server come messaggio broadcast
                     sock.sendall(messaggio.encode())
+
         except KeyboardInterrupt:
             print("\nChiusura del client.")
             sock.close()
