@@ -1,28 +1,37 @@
 import socket
 import threading
 import json
-from Crypto.PublicKey import RSA
 import os
+from datetime import datetime
+from Crypto.PublicKey import RSA
 
 # Dizionario per memorizzare gli utenti connessi
 utenti_connessi = {}  # username: { 'conn': connessione, 'indirizzo': indirizzo, 'chiave_pubblica': chiave_pubblica, 'gruppo': gruppo, 'psk': psk, 'mode': 'broadcast' o 'multicast' }
 
-# Contatore per i file di log
-contatore_log = 1
-
 # Memorizza i gruppi e le loro PSK
 gruppi = {}
 
+# Funzione per inizializzare il contatore del file di log
+def inizializza_contatore_log():
+    contatore_log = 1
+    while os.path.exists(f"chat_{contatore_log}.txt"):
+        contatore_log += 1
+    return contatore_log
+
 # Funzione per gestire i messaggi dei client
-def gestisci_client(conn, indirizzo):
-    global contatore_log
-    # Riceve le informazioni iniziali dal client
-    dati_iniziali = conn.recv(4096).decode()
-    info = json.loads(dati_iniziali)
-    username = info['username']
-    chiave_pubblica = info['chiave_pubblica']
-    gruppo = info['gruppo']
-    psk_gruppo = info['psk_gruppo']
+def gestisci_client(conn, indirizzo, contatore_log):
+    try:
+        # Riceve le informazioni iniziali dal client
+        dati_iniziali = conn.recv(4096).decode()
+        info = json.loads(dati_iniziali)
+        username = info['username']
+        chiave_pubblica = info['chiave_pubblica']
+        gruppo = info['gruppo']
+        psk_gruppo = info['psk_gruppo']
+    except Exception as e:
+        print(f"Errore nella ricezione dei dati iniziali: {e}")
+        conn.close()
+        return
 
     # Controlla se il gruppo esiste già e verifica la PSK
     if gruppo in gruppi:
@@ -36,11 +45,19 @@ def gestisci_client(conn, indirizzo):
     # Memorizza l'utente
     utenti_connessi[username] = {'conn': conn, 'indirizzo': indirizzo, 'chiave_pubblica': chiave_pubblica, 'gruppo': gruppo, 'psk': psk_gruppo, 'mode': 'broadcast', 'encrypt': False}
 
+    # Invia messaggio di benvenuto al client
+    conn.sendall("Connesso al server. Benvenuto! per info sui comandi /help".encode())
+
     # Invia messaggio di broadcast agli altri utenti
-    messaggio_broadcast = f"{username} si è connesso."
+    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    messaggio_broadcast = f"[{timestamp}] {username} si è connesso."
     for user in utenti_connessi:
         if user != username:
             utenti_connessi[user]['conn'].sendall(messaggio_broadcast.encode())
+
+    # Salva l'evento di connessione nel log
+    with open(f"chat_{contatore_log}.txt", "a", encoding='utf-8') as f:
+        f.write(f"[{timestamp}] {indirizzo[0]}:{indirizzo[1]} {username} si è connesso.\n")
 
     # Loop per ricevere messaggi dal client
     while True:
@@ -49,12 +66,13 @@ def gestisci_client(conn, indirizzo):
             if not messaggio:
                 break
 
-            # Salva il messaggio nel log
-            with open(f"chat_{contatore_log}.txt", "ab") as f:
-                f.write(messaggio + b"\n")
-            contatore_log += 1
-
             messaggio_decodificato = messaggio.decode(errors='ignore')
+
+            timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+            # Salva il messaggio nel log con IP, porta, username e timestamp
+            with open(f"chat_{contatore_log}.txt", "a", encoding='utf-8') as f:
+                f.write(f"[{timestamp}] {indirizzo[0]}:{indirizzo[1]} {username}: {messaggio_decodificato}\n")
 
             if messaggio_decodificato.startswith('/'):
                 # Comando
@@ -66,7 +84,8 @@ def gestisci_client(conn, indirizzo):
                     contenuto_messaggio = messaggio_decodificato.partition(destinatario)[2].strip()
                     # Inoltra il messaggio privato al destinatario
                     if destinatario in utenti_connessi:
-                        utenti_connessi[destinatario]['conn'].sendall(f"[Whisper da {username}]: {contenuto_messaggio}".encode())
+                        messaggio_privato = f"[{timestamp}] [Whisper da {username}]: {contenuto_messaggio}"
+                        utenti_connessi[destinatario]['conn'].sendall(messaggio_privato.encode())
                     else:
                         conn.sendall(f"Errore: utente {destinatario} non trovato.".encode())
 
@@ -105,9 +124,10 @@ def gestisci_client(conn, indirizzo):
                 # Messaggio normale
                 mode = utenti_connessi[username]['mode']
                 if mode == 'broadcast':
+                    formatted_message = f"[{timestamp}] {username}: {messaggio_decodificato}"
                     for user in utenti_connessi:
                         if utenti_connessi[user]['mode'] == 'broadcast':
-                            utenti_connessi[user]['conn'].sendall(f"{username}: {messaggio_decodificato}".encode())
+                            utenti_connessi[user]['conn'].sendall(formatted_message.encode())
                 elif mode == 'multicast':
                     # Invia messaggio al gruppo
                     for user in utenti_connessi:
@@ -124,10 +144,24 @@ def gestisci_client(conn, indirizzo):
     del utenti_connessi[username]
     conn.close()
 
+    # Informa gli altri utenti che l'utente si è disconnesso
+    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    messaggio_disconnessione = f"[{timestamp}] {username} si è disconnesso."
+    for user in utenti_connessi:
+        utenti_connessi[user]['conn'].sendall(messaggio_disconnessione.encode())
+
+    # Salva l'evento di disconnessione nel log
+    with open(f"chat_{contatore_log}.txt", "a", encoding='utf-8') as f:
+        f.write(f"[{timestamp}] {indirizzo[0]}:{indirizzo[1]} {username} si è disconnesso.\n")
+
 # Configurazione del server
 def avvia_server():
     host = '0.0.0.0'
-    port = 8000  # Usa la porta che preferisci
+    port = 8000  # Puoi cambiare la porta se necessario
+
+    # Inizializza il contatore del file di log
+    contatore_log = inizializza_contatore_log()
+    print(f"Il server utilizzerà il file di log: chat_{contatore_log}.txt")
 
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_socket.bind((host, port))
@@ -137,7 +171,7 @@ def avvia_server():
 
     while True:
         conn, indirizzo = server_socket.accept()
-        threading.Thread(target=gestisci_client, args=(conn, indirizzo), daemon=True).start()
+        threading.Thread(target=gestisci_client, args=(conn, indirizzo, contatore_log), daemon=True).start()
 
 if __name__ == "__main__":
     avvia_server()

@@ -35,6 +35,7 @@ def ricevi_messaggi(sock, gruppo, psk_gruppo, chiave_privata, queue_pubkey):
                     # Metti la chiave pubblica nella coda
                     queue_pubkey.put((destinatario, chiave_pubblica_dest))
                 else:
+                    # Messaggio normale o messaggio di benvenuto
                     print(messaggio)
             except UnicodeDecodeError:
                 # Se fallisce, prova a decriptare con AES (per messaggi multicast)
@@ -80,15 +81,25 @@ if __name__ == "__main__":
     }
     sock.sendall(json.dumps(info).encode())
 
-    # Stato iniziale
-    encrypt = False
-    mode = 'broadcast'
-
     # Coda per ricevere la chiave pubblica del destinatario
     queue_pubkey = queue.Queue()
 
     # Avvia thread per ricevere messaggi
     threading.Thread(target=ricevi_messaggi, args=(sock, gruppo, psk_gruppo, chiave_privata, queue_pubkey), daemon=True).start()
+
+    # Stato iniziale
+    encrypt = False
+    mode = 'broadcast'
+
+    # Dichiara i comandi disponibili
+    help_message = """
+Comandi disponibili:
+/help - Mostra questo messaggio di aiuto
+/whisper <username> <messaggio> - Invia un messaggio privato a un utente
+/encrypt <on/off> - Abilita o disabilita la crittografia per i messaggi privati
+/broadcast - Passa alla modalità broadcast (messaggi a tutti)
+/multicast - Passa alla modalità multicast (messaggi al gruppo)
+"""
 
     while True:
         try:
@@ -164,8 +175,12 @@ if __name__ == "__main__":
                     # Informa il server
                     sock.sendall(messaggio.encode())
 
+                elif comando == '/help':
+                    print(help_message)
+
                 else:
-                    sock.sendall(messaggio.encode())
+                    print("Comando non riconosciuto. Digita /help per la lista dei comandi.")
+
             else:
                 # Messaggio normale
                 if mode == 'multicast':
