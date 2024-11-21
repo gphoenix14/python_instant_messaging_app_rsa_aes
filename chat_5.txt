@@ -1,8 +1,0 @@
-[2024-11-21 23:46:22] 127.0.0.1:53002 giuseppe si è connesso.
-[2024-11-21 23:46:25] 127.0.0.1:53003 andrea si è connesso.
-[2024-11-21 23:46:26] 127.0.0.1:53003 andrea: ciao
-[2024-11-21 23:46:32] 127.0.0.1:53003 andrea: /get_pubkey giuseppe
-[2024-11-21 23:46:39] 127.0.0.1:53003 andrea: /get_pubkey giuseppe
-[2024-11-21 23:47:14] 127.0.0.1:53003 andrea si è disconnesso.
-[2024-11-21 23:47:34] 127.0.0.1:53032 andrea si è connesso.
-[2024-11-21 23:47:37] 127.0.0.1:53002 giuseppe si è disconnesso.
