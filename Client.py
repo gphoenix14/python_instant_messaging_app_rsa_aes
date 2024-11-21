@@ -17,16 +17,24 @@ def ricevi_messaggi(sock, gruppo, psk_gruppo, chiave_privata, queue_pubkey):
             try:
                 # Prova a decodificare come stringa
                 messaggio = data.decode()
-                if messaggio.startswith("[Whisper da"):
+                if "[Whisper da" in messaggio:
                     # Messaggio privato
-                    # Estrae la parte crittografata
-                    parti = messaggio.split(":", 1)
-                    if len(parti) == 2:
-                        messaggio_crittografato = bytes.fromhex(parti[1].strip())
-                        # Decripta con la chiave privata
-                        cipher_rsa = PKCS1_OAEP.new(chiave_privata)
-                        messaggio_decriptato = cipher_rsa.decrypt(messaggio_crittografato)
-                        print(f"{parti[0]}: {messaggio_decriptato.decode()}")
+                    # Trova l'indice di "]:"
+                    indice_header_end = messaggio.find("]:")
+                    if indice_header_end != -1:
+                        # Header include timestamp e "[Whisper da username]"
+                        header = messaggio[:indice_header_end+2]
+                        # Il messaggio criptato è il resto
+                        messaggio_crittografato_hex = messaggio[indice_header_end+2:].strip()
+                        try:
+                            messaggio_crittografato = bytes.fromhex(messaggio_crittografato_hex)
+                            # Decripta con la chiave privata
+                            cipher_rsa = PKCS1_OAEP.new(chiave_privata)
+                            messaggio_decriptato = cipher_rsa.decrypt(messaggio_crittografato)
+                            print(f"{header} {messaggio_decriptato.decode()}")
+                        except ValueError:
+                            # Se non è esadecimale, stampa come è
+                            print(messaggio)
                     else:
                         print(messaggio)
                 elif messaggio.startswith("/pubkey_response"):
@@ -88,7 +96,7 @@ if __name__ == "__main__":
     threading.Thread(target=ricevi_messaggi, args=(sock, gruppo, psk_gruppo, chiave_privata, queue_pubkey), daemon=True).start()
 
     # Stato iniziale
-    encrypt = False
+    encrypt = True  # La crittografia è attiva di default
     mode = 'broadcast'
 
     # Dichiara i comandi disponibili
