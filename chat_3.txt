@@ -1,2 +1,0 @@
-[2024-11-21 16:37:45] 127.0.0.1:59563 giuseppe si è connesso.
-[2024-11-21 16:38:05] 127.0.0.1:59563 giuseppe si è disconnesso.
