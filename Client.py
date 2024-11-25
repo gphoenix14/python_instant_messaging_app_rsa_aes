@@ -4,9 +4,10 @@ import json
 import sys
 import queue
 from Crypto.PublicKey import RSA
-from Crypto.Cipher import PKCS1_OAEP
+from Crypto.Cipher import PKCS1_OAEP, AES
+from Crypto.Util.Padding import pad, unpad
 
-def ricevi_messaggi(sock, chiave_privata, queue_pubkey):
+def ricevi_messaggi(sock, chiave_privata, group_psk, queue_pubkey):
     while True:
         try:
             data = sock.recv(4096)
@@ -17,18 +18,15 @@ def ricevi_messaggi(sock, chiave_privata, queue_pubkey):
                 # Prova a decodificare come stringa
                 messaggio = data.decode()
                 if messaggio.startswith("Errore:"):
-                    # Errore ricevuto dal server (es. username già in uso)
+                    # Errore ricevuto dal server
                     print(messaggio)
                     sock.close()
                     sys.exit()
                 elif "[Whisper da" in messaggio:
                     # Messaggio privato
-                    # Trova l'indice di "]:"
                     indice_header_end = messaggio.find("]:")
                     if indice_header_end != -1:
-                        # Header include timestamp e "[Whisper da username]"
                         header = messaggio[:indice_header_end+2]
-                        # Il messaggio criptato è il resto
                         messaggio_crittografato_hex = messaggio[indice_header_end+2:].strip()
                         try:
                             messaggio_crittografato = bytes.fromhex(messaggio_crittografato_hex)
@@ -46,6 +44,22 @@ def ricevi_messaggi(sock, chiave_privata, queue_pubkey):
                     _, destinatario, chiave_pubblica_dest = messaggio.split(" ", 2)
                     # Metti la chiave pubblica nella coda
                     queue_pubkey.put((destinatario, chiave_pubblica_dest))
+                elif messaggio.startswith("[") and "[Gruppo" in messaggio:
+                    # Messaggio di gruppo
+                    if encrypt:
+                        # Riceve il messaggio criptato in formato hex
+                        messaggio_criptato_hex = messaggio.split("]")[-1].strip()
+                        try:
+                            psk_bytes = group_psk.encode()
+                            cipher_aes = AES.new(psk_bytes.ljust(32)[:32], AES.MODE_CBC, iv=psk_bytes.ljust(16)[:16])
+                            messaggio_decriptato = unpad(cipher_aes.decrypt(bytes.fromhex(messaggio_criptato_hex)), AES.block_size).decode()
+                            # Ricostruisce il messaggio originale
+                            header = "]".join(messaggio.split("]")[:-1]) + "] "
+                            print(f"{header}{messaggio_decriptato}")
+                        except Exception as e:
+                            print(f"Errore nella decriptazione del messaggio di gruppo: {e}")
+                    else:
+                        print(messaggio)
                 else:
                     # Messaggio normale o messaggio di benvenuto
                     print(messaggio)
@@ -57,8 +71,8 @@ def ricevi_messaggi(sock, chiave_privata, queue_pubkey):
             break
 
 if __name__ == "__main__":
-    if len(sys.argv) != 6:
-        print("Uso: python client.py <ip_server> <porta_server> <username> <path_chiave_pubblica> <path_chiave_privata>")
+    if len(sys.argv) != 8:
+        print("Uso: python client.py <ip_server> <porta_server> <username> <path_chiave_pubblica> <path_chiave_privata> <group_name> <psk>")
         sys.exit()
 
     ip_server = sys.argv[1]
@@ -66,6 +80,8 @@ if __name__ == "__main__":
     username = sys.argv[3]
     path_chiave_pubblica = sys.argv[4]
     path_chiave_privata = sys.argv[5]
+    group_name = sys.argv[6]
+    group_psk = sys.argv[7]
 
     # Legge la chiave pubblica dal file
     with open(path_chiave_pubblica, 'r') as f:
@@ -79,10 +95,20 @@ if __name__ == "__main__":
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.connect((ip_server, porta_server))
 
+    # Riceve la chiave pubblica del server
+    server_public_key_pem = sock.recv(4096)
+    server_public_key = RSA.import_key(server_public_key_pem)
+    cipher_rsa = PKCS1_OAEP.new(server_public_key)
+
+    # Cripta il PSK con la chiave pubblica del server
+    psk_encrypted = cipher_rsa.encrypt(group_psk.encode())
+
     # Invia le informazioni iniziali al server
     info = {
         'username': username,
-        'chiave_pubblica': chiave_pubblica
+        'chiave_pubblica': chiave_pubblica,
+        'group_name': group_name,
+        'psk_encrypted': psk_encrypted.hex()
     }
     sock.sendall(json.dumps(info).encode())
 
@@ -102,11 +128,12 @@ if __name__ == "__main__":
     public_keys_cache = {}  # username: chiave_pubblica
 
     # Avvia thread per ricevere messaggi
-    threading.Thread(target=ricevi_messaggi, args=(sock, chiave_privata, queue_pubkey), daemon=True).start()
+    threading.Thread(target=ricevi_messaggi, args=(sock, chiave_privata, group_psk, queue_pubkey), daemon=True).start()
 
     # Stato iniziale
     encrypt = True  # La crittografia è attiva di default
     current_recipient = None  # Nessun destinatario di chat privata di default
+    mode = 'broadcast'  # Modalità iniziale
 
     # Dichiara i comandi disponibili
     help_message = """
@@ -117,8 +144,11 @@ Comandi disponibili:
 /whisper <username> <messaggio> - Invia un messaggio privato a un utente
 /refresh_key <username> - Aggiorna la chiave pubblica di un utente
 /print_keys - Mostra le chiavi pubbliche in cache
-/encrypt <on/off> - Abilita o disabilita la crittografia per i messaggi privati
+/encrypt <on/off> - Abilita o disabilita la crittografia per i messaggi privati e di gruppo
+/multicast - Passa alla modalità multicast (messaggi al gruppo)
 """
+
+    print("Per info sui comandi digita /help")
 
     while True:
         try:
@@ -132,10 +162,18 @@ Comandi disponibili:
                         print("Uso corretto: /chat <username>")
                         continue
                     current_recipient = comandi[1]
+                    mode = 'private'
                     print(f"Modalità chat privata con {current_recipient} attivata.")
                 elif comando == '/broadcast':
                     current_recipient = None
+                    mode = 'broadcast'
                     print("Modalità broadcast attivata.")
+                    sock.sendall(messaggio.encode())
+                elif comando == '/multicast':
+                    current_recipient = None
+                    mode = 'multicast'
+                    print("Modalità multicast attivata.")
+                    sock.sendall(messaggio.encode())
                 elif comando == '/whisper':
                     if len(comandi) < 3:
                         print("Uso corretto: /whisper <destinatario> <messaggio>")
@@ -232,13 +270,15 @@ Comandi disponibili:
                     stato = comandi[1]
                     if stato == 'on':
                         encrypt = True
+                        print("Crittografia abilitata.")
+                        sock.sendall(messaggio.encode())
                     elif stato == 'off':
                         encrypt = False
+                        print("Crittografia disabilitata.")
+                        sock.sendall(messaggio.encode())
                     else:
                         print("Comando non riconosciuto.")
                         continue
-                    # Informa il server
-                    sock.sendall(messaggio.encode())
 
                 elif comando == '/help':
                     print(help_message)
@@ -247,7 +287,7 @@ Comandi disponibili:
                     print("Comando non riconosciuto. Digita /help per la lista dei comandi.")
 
             else:
-                if current_recipient:
+                if mode == 'private' and current_recipient:
                     # Invia il messaggio come whisper al destinatario corrente
                     destinatario = current_recipient
                     messaggio_privato = messaggio
@@ -292,6 +332,17 @@ Comandi disponibili:
                     else:
                         # Invia il messaggio in chiaro
                         sock.sendall(f"/whisper {destinatario} {messaggio_privato}".encode())
+                elif mode == 'multicast':
+                    # Invio messaggio al gruppo
+                    if encrypt:
+                        # Cripta il messaggio con il PSK del gruppo
+                        psk_bytes = group_psk.encode()
+                        cipher_aes = AES.new(psk_bytes.ljust(32)[:32], AES.MODE_CBC, iv=psk_bytes.ljust(16)[:16])
+                        messaggio_criptato = cipher_aes.encrypt(pad(messaggio.encode(), AES.block_size))
+                        messaggio_hex = messaggio_criptato.hex()
+                        sock.sendall(messaggio_hex.encode())
+                    else:
+                        sock.sendall(messaggio.encode())
                 else:
                     # Invia il messaggio al server come messaggio broadcast
                     sock.sendall(messaggio.encode())

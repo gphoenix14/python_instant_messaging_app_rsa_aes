@@ -5,9 +5,38 @@ import os
 from datetime import datetime
 import argparse
 from Crypto.PublicKey import RSA
+from Crypto.Cipher import PKCS1_OAEP, AES
+from Crypto.Util.Padding import pad, unpad
 
 # Dizionario per memorizzare gli utenti connessi
-utenti_connessi = {}  # username: { 'conn': connessione, 'indirizzo': indirizzo, 'chiave_pubblica': chiave_pubblica }
+utenti_connessi = {}  # username: { 'conn': connessione, 'indirizzo': indirizzo, 'chiave_pubblica': chiave_pubblica, 'group': gruppo, 'mode': 'broadcast'/'multicast', 'encrypt': True/False }
+
+# Dizionario per memorizzare i gruppi
+gruppi = {}  # group_name: { 'psk': psk, 'users': set([usernames]) }
+
+# Percorsi dei file delle chiavi RSA del server
+SERVER_PRIVATE_KEY_FILE = 'server_private.pem'
+SERVER_PUBLIC_KEY_FILE = 'server_public.pem'
+
+# Funzione per generare o caricare le chiavi RSA del server
+def carica_o_genera_chiavi():
+    if os.path.exists(SERVER_PRIVATE_KEY_FILE) and os.path.exists(SERVER_PUBLIC_KEY_FILE):
+        # Carica le chiavi esistenti
+        with open(SERVER_PRIVATE_KEY_FILE, 'rb') as f:
+            chiave_privata = RSA.import_key(f.read())
+        with open(SERVER_PUBLIC_KEY_FILE, 'rb') as f:
+            chiave_pubblica = RSA.import_key(f.read())
+    else:
+        # Genera nuove chiavi
+        chiave = RSA.generate(2048)
+        chiave_privata = chiave
+        chiave_pubblica = chiave.publickey()
+        # Salva le chiavi
+        with open(SERVER_PRIVATE_KEY_FILE, 'wb') as f:
+            f.write(chiave_privata.export_key('PEM'))
+        with open(SERVER_PUBLIC_KEY_FILE, 'wb') as f:
+            f.write(chiave_pubblica.export_key('PEM'))
+    return chiave_privata, chiave_pubblica
 
 # Funzione per inizializzare il contatore del file di log
 def inizializza_contatore_log():
@@ -17,20 +46,49 @@ def inizializza_contatore_log():
     return contatore_log
 
 # Funzione per gestire i messaggi dei client
-def gestisci_client(conn, indirizzo, contatore_log):
+def gestisci_client(conn, indirizzo, contatore_log, chiave_privata):
     try:
+        # Invia la chiave pubblica del server al client
+        with open(SERVER_PUBLIC_KEY_FILE, 'rb') as f:
+            chiave_pubblica_server = f.read()
+        conn.sendall(chiave_pubblica_server)
+
         # Riceve le informazioni iniziali dal client
         dati_iniziali_bytes = conn.recv(4096)
-        dati_iniziali = dati_iniziali_bytes.decode()
-        info = json.loads(dati_iniziali)
+        info = json.loads(dati_iniziali_bytes.decode())
         username = info['username']
         chiave_pubblica = info['chiave_pubblica']
+        group_name = info['group_name']
+        psk_encrypted = bytes.fromhex(info['psk_encrypted'])
+
+        # Decripta il PSK usando la chiave privata del server
+        cipher_rsa = PKCS1_OAEP.new(chiave_privata)
+        psk = cipher_rsa.decrypt(psk_encrypted)
+
+        psk = psk.decode()
 
         # Verifica se l'username è già in uso
         if username in utenti_connessi:
             conn.sendall(f"Errore: L'username '{username}' è già in uso. Scegli un altro username.".encode())
             conn.close()
             return
+
+        # Gestione del gruppo
+        if group_name in gruppi:
+            # Il gruppo esiste già, verifica il PSK
+            if gruppi[group_name]['psk'] != psk:
+                conn.sendall(f"Errore: PSK errata per il gruppo '{group_name}'.".encode())
+                conn.close()
+                return
+        else:
+            # Crea un nuovo gruppo
+            gruppi[group_name] = {
+                'psk': psk,
+                'users': set()
+            }
+
+        # Aggiunge l'utente al gruppo
+        gruppi[group_name]['users'].add(username)
     except Exception as e:
         print(f"Errore nella ricezione dei dati iniziali: {e}")
         conn.close()
@@ -41,7 +99,9 @@ def gestisci_client(conn, indirizzo, contatore_log):
         'conn': conn,
         'indirizzo': indirizzo,
         'chiave_pubblica': chiave_pubblica,
-        'encrypt': False
+        'group': group_name,
+        'mode': 'broadcast',
+        'encrypt': True  # Di default la crittografia è attiva
     }
 
     # Invia messaggio di benvenuto al client
@@ -56,7 +116,7 @@ def gestisci_client(conn, indirizzo, contatore_log):
 
     # Salva l'evento di connessione nel log
     with open(f"chat_{contatore_log}.txt", "a", encoding='utf-8') as f:
-        f.write(f"[{timestamp}] {indirizzo[0]}:{indirizzo[1]} {username} si è connesso.\n")
+        f.write(f"[{timestamp}] {indirizzo[0]}:{indirizzo[1]} {username} si è connesso al gruppo {group_name}.\n")
 
     # Loop per ricevere messaggi dal client
     while True:
@@ -89,6 +149,9 @@ def gestisci_client(conn, indirizzo, contatore_log):
                         conn.sendall(f"Errore: utente {destinatario} non trovato.".encode())
 
                 elif comando == '/encrypt':
+                    if len(comandi) < 2:
+                        conn.sendall("Uso corretto: /encrypt <on/off>".encode())
+                        continue
                     stato = comandi[1]
                     if stato == 'on':
                         utenti_connessi[username]['encrypt'] = True
@@ -108,15 +171,73 @@ def gestisci_client(conn, indirizzo, contatore_log):
                     else:
                         conn.sendall(f"Errore: utente {target_username} non trovato.".encode())
 
+                elif comando == '/multicast':
+                    utenti_connessi[username]['mode'] = 'multicast'
+                    conn.sendall("Modalità multicast attivata.".encode())
+
+                elif comando == '/broadcast':
+                    utenti_connessi[username]['mode'] = 'broadcast'
+                    conn.sendall("Modalità broadcast attivata.".encode())
+
+                elif comando == '/help':
+                    help_message = """
+Comandi disponibili:
+/help - Mostra questo messaggio di aiuto
+/multicast - Passa alla modalità multicast (messaggi al gruppo)
+/broadcast - Passa alla modalità broadcast (messaggi a tutti)
+/encrypt <on/off> - Abilita o disabilita la crittografia per i messaggi di gruppo e privati
+"""
+                    conn.sendall(help_message.encode())
+
                 else:
                     conn.sendall("Comando non riconosciuto.".encode())
 
             else:
                 # Messaggio normale
-                formatted_message = f"[{timestamp}] {username}: {messaggio_decodificato}"
-                for user in utenti_connessi:
-                    # Invia il messaggio a tutti, compreso il mittente
-                    utenti_connessi[user]['conn'].sendall(formatted_message.encode())
+                user_mode = utenti_connessi[username]['mode']
+                user_encrypt = utenti_connessi[username]['encrypt']
+
+                if user_mode == 'multicast':
+                    group_name = utenti_connessi[username]['group']
+                    psk = gruppi[group_name]['psk']
+
+                    if user_encrypt:
+                        # Decripta il messaggio usando il PSK
+                        try:
+                            psk_bytes = psk.encode()
+                            cipher_aes = AES.new(psk_bytes.ljust(32)[:32], AES.MODE_CBC, iv=psk_bytes.ljust(16)[:16])
+                            messaggio_decriptato = unpad(cipher_aes.decrypt(bytes.fromhex(messaggio_decodificato)), AES.block_size).decode()
+                        except Exception as e:
+                            print(f"Errore nella decriptazione del messaggio: {e}")
+                            continue
+                    else:
+                        messaggio_decriptato = messaggio_decodificato
+
+                    formatted_message = f"[{timestamp}] [Gruppo {group_name}] {username}: {messaggio_decriptato}"
+
+                    # Salva il messaggio nel log
+                    with open(f"chat_{contatore_log}.txt", "a", encoding='utf-8') as f:
+                        f.write(f"{formatted_message}\n")
+
+                    # Invia il messaggio agli utenti del gruppo
+                    for user in gruppi[group_name]['users']:
+                        if user != username:
+                            conn_dest = utenti_connessi[user]['conn']
+                            if utenti_connessi[user]['encrypt']:
+                                # Cripta il messaggio con il PSK
+                                psk_bytes = psk.encode()
+                                cipher_aes = AES.new(psk_bytes.ljust(32)[:32], AES.MODE_CBC, iv=psk_bytes.ljust(16)[:16])
+                                messaggio_criptato = cipher_aes.encrypt(pad(messaggio_decriptato.encode(), AES.block_size))
+                                messaggio_hex = messaggio_criptato.hex()
+                                conn_dest.sendall(f"[{timestamp}] [Gruppo {group_name}] {messaggio_hex}".encode())
+                            else:
+                                conn_dest.sendall(formatted_message.encode())
+                else:
+                    # Messaggio broadcast
+                    formatted_message = f"[{timestamp}] {username}: {messaggio_decodificato}"
+                    for user in utenti_connessi:
+                        # Invia il messaggio a tutti, compreso il mittente
+                        utenti_connessi[user]['conn'].sendall(formatted_message.encode())
 
         except Exception as e:
             print(f"Errore: {e}")
@@ -125,6 +246,9 @@ def gestisci_client(conn, indirizzo, contatore_log):
     # Rimuove l'utente dalla lista quando si disconnette
     del utenti_connessi[username]
     conn.close()
+
+    # Rimuove l'utente dal gruppo
+    gruppi[group_name]['users'].remove(username)
 
     # Informa gli altri utenti che l'utente si è disconnesso
     timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -149,6 +273,10 @@ def avvia_server():
     contatore_log = inizializza_contatore_log()
     print(f"Il server utilizzerà il file di log: chat_{contatore_log}.txt")
 
+    # Carica o genera le chiavi RSA del server
+    chiave_privata, chiave_pubblica = carica_o_genera_chiavi()
+    print("Chiavi RSA del server caricate o generate.")
+
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_socket.bind((host, port))
     server_socket.listen()
@@ -157,7 +285,7 @@ def avvia_server():
 
     while True:
         conn, indirizzo = server_socket.accept()
-        threading.Thread(target=gestisci_client, args=(conn, indirizzo, contatore_log), daemon=True).start()
+        threading.Thread(target=gestisci_client, args=(conn, indirizzo, contatore_log, chiave_privata), daemon=True).start()
 
 if __name__ == "__main__":
     avvia_server()
